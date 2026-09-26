@@ -23,19 +23,39 @@ def connect():
     return psycopg.connect(DSN, row_factory=dict_row)
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id serial PRIMARY KEY,
-    sheet text NOT NULL,
-    cyan_mm double precision NOT NULL,
-    magenta_mm double precision NOT NULL,
-    status text NOT NULL,
-    verdict text NOT NULL DEFAULT '',
-    reason text NOT NULL DEFAULT '',
-    created_by text NOT NULL,
-    created_at timestamptz NOT NULL
-);
-"""
+SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS jobs (
+        id serial PRIMARY KEY,
+        sheet text NOT NULL,
+        cyan_mm double precision NOT NULL,
+        magenta_mm double precision NOT NULL,
+        status text NOT NULL,
+        verdict text NOT NULL DEFAULT '',
+        reason text NOT NULL DEFAULT '',
+        urgent boolean NOT NULL DEFAULT false,
+        created_by text NOT NULL,
+        created_at timestamptz NOT NULL
+    )""",
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS urgent boolean NOT NULL DEFAULT false",
+    """CREATE TABLE IF NOT EXISTS throttle_policy (
+        id boolean PRIMARY KEY DEFAULT true CHECK (id),
+        threshold integer NOT NULL DEFAULT 3,
+        slow_seconds integer NOT NULL DEFAULT 30
+    )""",
+    """CREATE TABLE IF NOT EXISTS throttle_state (
+        id boolean PRIMARY KEY DEFAULT true CHECK (id),
+        slow_until timestamptz,
+        last_trigger_job_id integer NOT NULL DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS throttle_events (
+        id serial PRIMARY KEY,
+        event text NOT NULL,
+        detail text NOT NULL DEFAULT '',
+        created_at timestamptz NOT NULL
+    )""",
+    "INSERT INTO throttle_policy (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+    "INSERT INTO throttle_state (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+]
 
 
 class LoginIn(BaseModel):
@@ -47,6 +67,12 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+    urgent: bool = False
+
+
+class PolicyIn(BaseModel):
+    threshold: int
+    slow_seconds: int
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -73,7 +99,8 @@ app = FastAPI(title="印刷套准复核台")
 @app.on_event("startup")
 def startup():
     with connect() as conn:
-        conn.execute(SCHEMA)
+        for statement in SCHEMA_STATEMENTS:
+            conn.execute(statement)
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
             now = datetime.now(timezone.utc)
@@ -106,7 +133,7 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, urgent, created_by FROM jobs ORDER BY id DESC"
         ).fetchall()
 
 
@@ -114,10 +141,48 @@ def list_jobs(_user: dict = Depends(current_user)):
 def enqueue(body: JobIn, user: dict = Depends(require_writer)):
     with connect() as conn:
         row = conn.execute(
-            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, created_by, created_at)
-               VALUES (%s, %s, %s, 'pending', %s, %s)
+            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, urgent, created_by, created_at)
+               VALUES (%s, %s, %s, 'pending', %s, %s, %s)
                RETURNING id, sheet, status, verdict""",
-            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, user["username"], datetime.now(timezone.utc)),
+            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, body.urgent, user["username"], datetime.now(timezone.utc)),
         ).fetchone()
         conn.commit()
     return row
+
+
+@app.get("/api/throttle/policy")
+def get_throttle_policy(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        policy = conn.execute("SELECT threshold, slow_seconds FROM throttle_policy WHERE id").fetchone()
+        state = conn.execute("SELECT slow_until FROM throttle_state WHERE id").fetchone()
+    now = datetime.now(timezone.utc)
+    active = state["slow_until"] is not None and state["slow_until"] > now
+    return {
+        "threshold": policy["threshold"],
+        "slow_seconds": policy["slow_seconds"],
+        "active": active,
+        "slow_until": state["slow_until"] if active else None,
+    }
+
+
+@app.put("/api/throttle/policy")
+def update_throttle_policy(body: PolicyIn, _user: dict = Depends(require_writer)):
+    if not 1 <= body.threshold <= 20:
+        raise HTTPException(status_code=400, detail="连续失败阈值需在 1-20 之间")
+    if not 1 <= body.slow_seconds <= 3600:
+        raise HTTPException(status_code=400, detail="缓领秒数需在 1-3600 之间")
+    with connect() as conn:
+        conn.execute(
+            "UPDATE throttle_policy SET threshold = %s, slow_seconds = %s WHERE id",
+            (body.threshold, body.slow_seconds),
+        )
+        conn.commit()
+    return {"threshold": body.threshold, "slow_seconds": body.slow_seconds}
+
+
+@app.get("/api/throttle/events")
+def list_throttle_events(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, event, detail, created_at FROM throttle_events ORDER BY id DESC LIMIT 100"
+        ).fetchall()
